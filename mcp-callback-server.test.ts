@@ -20,13 +20,47 @@ import {
 import { getConfiguredOAuthCallbackPort, getOAuthCallbackPath, getOAuthCallbackPort, McpOAuthProvider } from "./mcp-oauth-provider.ts"
 
 /**
- * Occupy `port` on whichever loopback addresses this host actually has, so the
- * port is genuinely unavailable to the callback listener. A family that cannot
- * bind is skipped rather than failing the fixture, so these tests behave the
- * same on single-family and dual-stack hosts. The returned function always
+ * Which loopback families this host can actually bind, probed once per run.
+ *
+ * A test that squats `[::1]`, or fetches `http://[::1]:…/callback`, is only
+ * meaningful where IPv6 loopback exists; on an IPv4-only host it would fail for
+ * reasons unrelated to the code under test. The probe binds an ephemeral port on
+ * each family in turn, records the outcome, and closes every listener it
+ * opened, so nothing is left behind on any path.
+ */
+let loopbackAvailability: Promise<Set<string>> | undefined
+
+function availableLoopbackHosts(): Promise<Set<string>> {
+  loopbackAvailability ??= (async () => {
+    const available = new Set<string>()
+    for (const host of ["127.0.0.1", "::1"]) {
+      const probe = createServer()
+      try {
+        await new Promise<void>((resolve, reject) => {
+          probe.once("error", reject)
+          probe.listen(0, host, () => resolve())
+        })
+        available.add(host)
+      } catch {
+        // This family is unavailable on this host.
+      } finally {
+        await new Promise<void>((resolve) => probe.close(() => resolve()))
+      }
+    }
+    return available
+  })()
+  return loopbackAvailability
+}
+
+/**
+ * Occupy `port` on every loopback family this host has, so the port is
+ * genuinely unavailable to the callback listener on all of them. A family that
+ * cannot bind is skipped rather than failing the fixture, so these tests behave
+ * the same on single-family and dual-stack hosts. The returned function always
  * closes every blocker that did open, including after a partial failure.
  */
 async function squatPort(port: number): Promise<() => Promise<void>> {
+  const available = await availableLoopbackHosts()
   const opened: import("node:http").Server[] = []
   const release = async () => {
     for (const server of opened.splice(0)) {
@@ -35,6 +69,7 @@ async function squatPort(port: number): Promise<() => Promise<void>> {
   }
   try {
     for (const host of ["127.0.0.1", "::1"]) {
+      if (!available.has(host)) continue
       const server = createServer((_req, res) => {
         res.writeHead(200)
         res.end("blocked")
@@ -55,6 +90,23 @@ async function squatPort(port: number): Promise<() => Promise<void>> {
     throw error
   }
   return release
+}
+
+/** Bind `port` on `host` for a test, failing loudly when the host lacks it. */
+async function squatHostOn(
+  host: string,
+  port: number,
+  body: string,
+): Promise<import("node:http").Server> {
+  const squatter = createServer((_req, res) => {
+    res.writeHead(200)
+    res.end(body)
+  })
+  await new Promise<void>((resolve, reject) => {
+    squatter.once("error", reject)
+    squatter.listen(port, host, resolve)
+  })
+  return squatter
 }
 
 async function getFreePort(): Promise<number> {
@@ -165,23 +217,21 @@ describe("mcp-callback-server", () => {
       // A configured redirect_uri naming [::1] sends the browser to that
       // literal. If the address is already taken, continuing would leave this
       // adapter advertising a callback that another local process receives.
+      // Squat whichever loopback family this host actually has: the point is
+      // that the advertised literal is held by someone else, and on an
+      // IPv4-only host that is 127.0.0.1.
+      const available = await availableLoopbackHosts()
+      const occupiedHost = available.has("::1") ? "::1" : available.has("127.0.0.1") ? "127.0.0.1" : undefined
+      assert.ok(occupiedHost, "expected at least one loopback family to be available")
       const port = await getFreePort()
-      const squatter = createServer((_req, res) => {
-        res.writeHead(200)
-        res.end("not the oauth callback")
-      })
-
-      await new Promise<void>((resolve, reject) => {
-        squatter.once("error", reject)
-        squatter.listen(port, "::1", resolve)
-      })
+      const squatter = await squatHostOn(occupiedHost!, port, "not the oauth callback")
 
       try {
         await assert.rejects(
           async () => await ensureCallbackServer({
             strictPort: true,
             port,
-            callbackHost: "::1",
+            callbackHost: occupiedHost!,
             oauthState: "occupied-redirect-state",
             reserveState: true,
           }),
@@ -199,15 +249,15 @@ describe("mcp-callback-server", () => {
       // `localhost` may resolve to either family, so binding one address and
       // still advertising `localhost` lets the browser pick the address this
       // process does not hold - and whoever does hold it gets the code.
+      // Occupy one family this host has. A configured `localhost` redirect must
+      // hold every family that exists, so holding any one of them is enough to
+      // prove the refusal; the unavailable-family tolerance is exercised by the
+      // test below instead.
+      const available = await availableLoopbackHosts()
+      const occupiedHost = [...available][0]
+      assert.ok(occupiedHost, "expected at least one loopback family to be available")
       const port = await getFreePort()
-      const squatter = createServer((_req, res) => {
-        res.writeHead(200)
-        res.end("not the oauth callback")
-      })
-      await new Promise<void>((resolve, reject) => {
-        squatter.once("error", reject)
-        squatter.listen(port, "::1", resolve)
-      })
+      const squatter = await squatHostOn(occupiedHost!, port, "not the oauth callback")
 
       try {
         await assert.rejects(
@@ -224,6 +274,38 @@ describe("mcp-callback-server", () => {
       } finally {
         await new Promise<void>((resolve) => squatter.close(() => resolve()))
       }
+    })
+
+    it("should serve an explicit localhost redirect on every loopback family this host has", async () => {
+      // A configured `localhost` must hold every loopback address that exists,
+      // because the browser picks the family. A family that does not exist is
+      // not required, so on a single-family host this must still succeed - the
+      // tolerance must not have become a requirement to fail.
+      const available = await availableLoopbackHosts()
+      const port = await getFreePort()
+
+      await ensureCallbackServer({
+        strictPort: true,
+        port,
+        callbackHost: "localhost",
+        oauthState: "localhost-families-state",
+        reserveState: true,
+      })
+
+      for (const host of available) {
+        const urlHost = host === "::1" ? "[::1]" : host
+        const probe = new URL(`http://${urlHost}:${port}/callback`)
+        probe.searchParams.set("code", "x")
+        probe.searchParams.set("state", "no-such-flow")
+        // 400 (not ECONNREFUSED) proves the request reached the handler.
+        assert.strictEqual(
+          (await fetch(probe)).status,
+          400,
+          `${urlHost} should reach the callback listener`,
+        )
+      }
+
+      releaseCallbackServer("localhost-families-state")
     })
 
     it("should still tolerate an absent loopback family for the default redirect", async () => {
@@ -284,7 +366,16 @@ describe("mcp-callback-server", () => {
       await ensureCallbackServer({ oauthState: "family-state", reserveState: true })
       const port = getOAuthCallbackPort()
 
-      for (const host of ["127.0.0.1", "[::1]", "localhost"]) {
+      // `localhost` always resolves, so it is always probed; the IP spellings are
+      // probed only where that family exists on this host, since an unreachable
+      // address would fail for a reason unrelated to the listener.
+      const available = await availableLoopbackHosts()
+      const spellings = [
+        "127.0.0.1",
+        ...(available.has("::1") ? ["[::1]"] : []),
+        "localhost",
+      ]
+      for (const host of spellings) {
         const probe = new URL(`http://${host}:${port}/callback`)
         probe.searchParams.set("code", "x")
         // An unknown state proves the request reached the handler: it is

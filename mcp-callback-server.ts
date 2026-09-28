@@ -213,6 +213,28 @@ function isLoopbackIpLiteral(host: string): boolean {
   return (LOOPBACK_CALLBACK_HOSTS as readonly string[]).includes(host)
 }
 
+/**
+ * Listen errors meaning the host has no such address family, as opposed to the
+ * address existing but being held by someone else.
+ *
+ * An IPv4-only host answers EADDRNOTAVAIL (or EAFNOSUPPORT/EPROTONOSUPPORT on
+ * stricter stacks) for `::1`, and an IPv6-only host does the same for 127.0.0.1.
+ * That is an absent family, not a contested one, so it must not be confused with
+ * EADDRINUSE: requiring a family that cannot exist would make an explicit
+ * `localhost` redirect unusable on every single-family host, while tolerating
+ * EADDRINUSE would hand the authorization code to whichever process holds it.
+ */
+const LOOPBACK_FAMILY_UNAVAILABLE_CODES = new Set([
+  "EADDRNOTAVAIL",
+  "EAFNOSUPPORT",
+  "EPROTONOSUPPORT",
+])
+
+function isLoopbackFamilyUnavailable(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code
+  return typeof code === "string" && LOOPBACK_FAMILY_UNAVAILABLE_CODES.has(code)
+}
+
 /** Whether the already-bound listeners can serve a redirect for `requestedHost`. */
 function boundHostsCoverRequest(bound: Map<string, Server>, requestedHost: string): boolean {
   if (bound.size === 0) return true
@@ -408,8 +430,10 @@ async function ensureCallbackServerLocked(options: EnsureCallbackServerOptions =
   //   that exact address must bind. Failing it would hand the authorization
   //   code to whoever holds it.
   // - A configured `localhost` is a name that may resolve to either family, so
-  //   every loopback address must bind. Binding one and still advertising
-  //   `localhost` leaves the browser free to pick the address we did not hold.
+  //   every loopback address that EXISTS must bind: binding one and still
+  //   advertising `localhost` leaves the browser free to pick the address we
+  //   did not hold. A family the host does not have cannot be the browser's
+  //   choice either, so its absence is tolerated (see isLoopbackFamilyUnavailable).
   // - The default is not load-bearing: the advertised redirect is composed from
   //   whichever address ends up bound, so an absent family cannot strand it and
   //   one bound address suffices.
@@ -417,9 +441,6 @@ async function ensureCallbackServerLocked(options: EnsureCallbackServerOptions =
   const requiredHost = configuredHost !== undefined && isLoopbackIpLiteral(requestedHost)
     ? requestedHost
     : undefined
-  const requireAllLoopback = configuredHost !== undefined
-    && isLoopbackAlias(requestedHost)
-    && !isLoopbackIpLiteral(requestedHost)
   const opened = new Map<string, Server>()
   let lastError: unknown
 
@@ -447,14 +468,19 @@ async function ensureCallbackServerLocked(options: EnsureCallbackServerOptions =
         // bind, whoever holds it would receive the authorization code, so fail
         // startup rather than advertise a callback this process never serves.
         if (host === requiredHost) throw error
-        // An explicit `localhost` redirect can resolve to this address, so it
-        // is required too: advertising a name the browser may resolve to an
-        // address we failed to hold would deliver the code elsewhere.
-        if (requireAllLoopback) throw error
-        // Otherwise this is an optional loopback family: an absent one must not
-        // block a host that is only IPv4 or only IPv6.
-        lastError = error
-        continue
+        // A family this host does not have can never be the address a browser
+        // picks for a loopback redirect, so its absence is not a failure. This
+        // covers the explicit `localhost` case too, where the other family is
+        // the one that must hold the callback.
+        if (isLoopbackFamilyUnavailable(error)) {
+          lastError = error
+          continue
+        }
+        // EADDRINUSE means the address exists and another process holds it -
+        // exactly the redirect this adapter is about to advertise. Tolerating it
+        // would deliver the authorization code elsewhere, so fail startup. Any
+        // other error is unknown, and failing closed is the safe default.
+        throw error
       }
     }
 
