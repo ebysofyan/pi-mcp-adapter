@@ -28,12 +28,14 @@ import { getConfiguredOAuthCallbackPort, getOAuthCallbackPath, getOAuthCallbackP
  * each family in turn, records the outcome, and closes every listener it
  * opened, so nothing is left behind on any path.
  */
+const LOOPBACK_PROBE_HOSTS = ["127.0.0.1", "::1"] as const
+
 let loopbackAvailability: Promise<Set<string>> | undefined
 
 function availableLoopbackHosts(): Promise<Set<string>> {
   loopbackAvailability ??= (async () => {
     const available = new Set<string>()
-    for (const host of ["127.0.0.1", "::1"]) {
+    for (const host of LOOPBACK_PROBE_HOSTS) {
       const probe = createServer()
       try {
         await new Promise<void>((resolve, reject) => {
@@ -170,12 +172,19 @@ describe("mcp-callback-server", () => {
     })
 
     it("should not treat another loopback spelling as a host switch", async () => {
-      // All loopback spellings name the same interface and the listener binds
-      // the whole set, so none of these may demand a rebind while an
-      // authorization is reserved.
+      // Loopback spellings name the same interface, so none of the families this
+      // host has may demand a rebind while an authorization is reserved. An
+      // address literal the host does not have is a genuine switch (its
+      // redirect_uri names an address nothing is listening on), so it is skipped.
       await ensureCallbackServer({ oauthState: "loopback-alias-state", reserveState: true })
 
-      for (const host of ["127.0.0.1", "::1", "localhost"]) {
+      const available = await availableLoopbackHosts()
+      const spellings = [
+        ...(available.has("127.0.0.1") ? ["127.0.0.1"] : []),
+        ...(available.has("::1") ? ["::1"] : []),
+        "localhost",
+      ]
+      for (const host of spellings) {
         await ensureCallbackServer({ callbackHost: host, oauthState: `alias-${host}`, reserveState: true })
         releaseCallbackServer(`alias-${host}`)
       }
@@ -368,13 +377,15 @@ describe("mcp-callback-server", () => {
 
       // `localhost` always resolves, so it is always probed; the IP spellings are
       // probed only where that family exists on this host, since an unreachable
-      // address would fail for a reason unrelated to the listener.
+      // address would fail for a reason unrelated to the listener. Gating 127.0.0.1
+      // matters on an IPv6-only host, where fetching it throws rather than 400s.
       const available = await availableLoopbackHosts()
       const spellings = [
-        "127.0.0.1",
+        ...(available.has("127.0.0.1") ? ["127.0.0.1"] : []),
         ...(available.has("::1") ? ["[::1]"] : []),
         "localhost",
       ]
+      assert.ok(available.size > 0, "expected at least one loopback family to be available")
       for (const host of spellings) {
         const probe = new URL(`http://${host}:${port}/callback`)
         probe.searchParams.set("code", "x")
@@ -386,6 +397,44 @@ describe("mcp-callback-server", () => {
       }
 
       releaseCallbackServer("family-state")
+    })
+
+    it("covers a localhost redirect from a listener bound to any loopback subset", async () => {
+      // The coverage rule behind "is this a host switch?". A loopback name is
+      // served by any bound loopback address, so a listener holding only the
+      // families this host has must not be read as needing a rebind - on a
+      // single-family host requiring the full set would deadlock the reservation.
+      // An explicit address literal, by contrast, names its address verbatim, so
+      // only that exact address covers it.
+      await ensureCallbackServer({ oauthState: "coverage-state", reserveState: true })
+
+      // Whatever is bound, `localhost` is covered.
+      await ensureCallbackServer({ callbackHost: "localhost", oauthState: "coverage-localhost", reserveState: true })
+      releaseCallbackServer("coverage-localhost")
+
+      // The unset default takes the alias path too: it must not be treated as
+      // depending on the 127.0.0.1 literal it materializes as.
+      await ensureCallbackServer({ oauthState: "coverage-default-again", reserveState: true })
+      releaseCallbackServer("coverage-default-again")
+
+      releaseCallbackServer("coverage-state")
+    })
+
+    it("treats an unavailable explicit loopback literal as a host switch", async () => {
+      // A redirect_uri naming `::1` on a host that has no ::1 cannot be served,
+      // so requesting it is a real switch and must be refused while an
+      // authorization is reserved - the opposite of the `localhost` rule.
+      const available = await availableLoopbackHosts()
+      if (available.size === LOOPBACK_PROBE_HOSTS.length) return  // dual-stack: nothing is absent
+      const absentHost = available.has("::1") ? "127.0.0.1" : "::1"
+      assert.ok(!available.has(absentHost))
+
+      await ensureCallbackServer({ oauthState: "absent-literal-state", reserveState: true })
+      await assert.rejects(
+        async () => await ensureCallbackServer({ callbackHost: absentHost }),
+        /cannot be switched while authorizations are pending/,
+      )
+      releaseCallbackServer("absent-literal-state")
     })
 
     it("allows a pending default authorization alongside an explicit localhost redirect", async () => {

@@ -235,12 +235,39 @@ function isLoopbackFamilyUnavailable(error: unknown): boolean {
   return typeof code === "string" && LOOPBACK_FAMILY_UNAVAILABLE_CODES.has(code)
 }
 
-/** Whether the already-bound listeners can serve a redirect for `requestedHost`. */
-function boundHostsCoverRequest(bound: Map<string, Server>, requestedHost: string): boolean {
+/**
+ * Whether the already-bound listeners can serve a redirect for `requestedHost`.
+ *
+ * `hostExplicit` distinguishes a configured `localhost` (or a configured address
+ * literal) from the unset default. The default resolves to the 127.0.0.1 literal
+ * only as a convenience, so it has to be recognized as a name that can land on
+ * whichever family bound, not as an address the redirect depends on.
+ *
+ * The rules:
+ * - An exact bound address always covers the request.
+ * - A name that is not a loopback spelling never covers without an exact match:
+ *   a listener on 127.0.0.1 cannot serve a redirect naming some other interface.
+ * - An explicitly configured address literal depends on that exact address. A
+ *   bound set holding only the other family cannot serve it, because the
+ *   redirect_uri names the address verbatim.
+ * - `localhost` and the default depend on *any* loopback address: a browser
+ *   resolving the name picks a family the host has, and every family that exists
+ *   is bound. So a single-family subset counts, and requiring the full set would
+ *   turn a host that lacks IPv6 (or IPv4) into a false "host switch" that cannot
+ *   be resolved while an authorization is reserved.
+ */
+function boundHostsCoverRequest(
+  bound: Map<string, Server>,
+  requestedHost: string,
+  hostExplicit: boolean,
+): boolean {
   if (bound.size === 0) return true
   if (bound.has(requestedHost)) return true
   if (!isLoopbackAlias(requestedHost)) return false
-  return LOOPBACK_CALLBACK_HOSTS.every((host) => bound.has(host))
+  if (hostExplicit && isLoopbackIpLiteral(requestedHost)) return false
+  // A loopback name: covered as long as something loopback is bound, since a
+  // family this host lacks is not one the browser can pick.
+  return [...bound.keys()].every((host) => isLoopbackAlias(host))
 }
 
 /** Timeout for callback completion (5 minutes) */
@@ -384,6 +411,7 @@ export async function ensureCallbackServer(options: EnsureCallbackServerOptions 
 async function ensureCallbackServerLocked(options: EnsureCallbackServerOptions = {}): Promise<void> {
   const requiredPort = options.port ?? getConfiguredOAuthCallbackPort()
   const strictPort = options.strictPort === true
+  const hostExplicit = options.callbackHost !== undefined
   const requestedHost = options.callbackHost ?? DEFAULT_OAUTH_CALLBACK_HOST
   const rawRequestedPath = options.callbackPath ?? DEFAULT_OAUTH_CALLBACK_PATH
   const requestedPath = rawRequestedPath.startsWith("/") ? rawRequestedPath : `/${rawRequestedPath}`
@@ -394,7 +422,7 @@ async function ensureCallbackServerLocked(options: EnsureCallbackServerOptions =
 
   const previousServers = servers
   const needsStrictRebind = Boolean(previousServers.size > 0 && strictPort && getOAuthCallbackPort() !== requiredPort)
-  const needsHostSwitch = !boundHostsCoverRequest(previousServers, requestedHost)
+  const needsHostSwitch = !boundHostsCoverRequest(previousServers, requestedHost, hostExplicit)
   const needsPathSwitch = Boolean(previousServers.size > 0 && getOAuthCallbackPath() !== requestedPath)
 
   if (previousServers.size > 0) {
