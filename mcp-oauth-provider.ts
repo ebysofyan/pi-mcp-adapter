@@ -92,6 +92,21 @@ function toOAuthTokens(tokens: StoredTokens): IssuerBoundTokens {
 const DEFAULT_OAUTH_CALLBACK_PORT = 19876
 const DEFAULT_OAUTH_CALLBACK_PATH = "/callback"
 
+/**
+ * Loopback host for the OAuth callback.
+ *
+ * RFC 8252 section 7.3 requires native-app loopback redirect URIs to use the
+ * IP literal, and authorization servers that validate the redirect URI
+ * against a registered set reject the `localhost` hostname. Advertising
+ * `localhost` therefore fails the authorize leg against stricter servers.
+ *
+ * This host is also the bind address for the callback listener, and the two
+ * must agree: `localhost` resolves to `::1` first on dual-stack hosts, so
+ * advertising `127.0.0.1` while binding `localhost` leaves the callback
+ * unreachable (ECONNREFUSED) after a successful authorization.
+ */
+const DEFAULT_OAUTH_CALLBACK_HOST = "127.0.0.1"
+
 let configuredOAuthCallbackPort = DEFAULT_OAUTH_CALLBACK_PORT
 
 if (process.env.MCP_OAUTH_CALLBACK_PORT) {
@@ -103,9 +118,18 @@ if (process.env.MCP_OAUTH_CALLBACK_PORT) {
 
 let oauthCallbackPort = configuredOAuthCallbackPort
 let oauthCallbackPath = DEFAULT_OAUTH_CALLBACK_PATH
+let oauthCallbackHost = DEFAULT_OAUTH_CALLBACK_HOST
 
 export function getConfiguredOAuthCallbackPort(): number {
   return configuredOAuthCallbackPort
+}
+
+export function getOAuthCallbackHost(): string {
+  return oauthCallbackHost
+}
+
+export function setOAuthCallbackHost(host: string): void {
+  oauthCallbackHost = host
 }
 
 export function getOAuthCallbackPort(): number {
@@ -287,7 +311,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
     this.flowState = initialState
     this.redirectUrlSnapshot = config.grantType === "client_credentials"
       ? undefined
-      : config.redirectUri ?? `http://localhost:${getOAuthCallbackPort()}${getOAuthCallbackPath()}`
+      : config.redirectUri ?? `http://${getOAuthCallbackHost()}:${getOAuthCallbackPort()}${getOAuthCallbackPath()}`
   }
 
   setAuthFetch(fetchFn: OAuthFetch): void {
@@ -816,4 +840,4 @@ export class McpOAuthProvider implements OAuthClientProvider {
   }
 }
 
-export { DEFAULT_OAUTH_CALLBACK_PORT, DEFAULT_OAUTH_CALLBACK_PATH }
+export { DEFAULT_OAUTH_CALLBACK_PORT, DEFAULT_OAUTH_CALLBACK_PATH, DEFAULT_OAUTH_CALLBACK_HOST }

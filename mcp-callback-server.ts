@@ -8,10 +8,13 @@
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "http"
 import { getAppName } from "./agent-dir.ts"
 import {
+  DEFAULT_OAUTH_CALLBACK_HOST,
   DEFAULT_OAUTH_CALLBACK_PATH,
   getConfiguredOAuthCallbackPort,
+  getOAuthCallbackHost,
   getOAuthCallbackPath,
   getOAuthCallbackPort,
+  setOAuthCallbackHost,
   setOAuthCallbackPath,
   setOAuthCallbackPort,
 } from "./mcp-oauth-provider.ts"
@@ -197,8 +200,11 @@ interface EnsureCallbackServerOptions {
   reserveState?: boolean
 }
 
-const DEFAULT_OAUTH_CALLBACK_HOST = "localhost"
-let callbackServerHost = DEFAULT_OAUTH_CALLBACK_HOST
+/**
+ * The loopback host is owned by `mcp-oauth-provider.ts` so the bind address
+ * and the redirect URI advertised to the authorization server can never
+ * drift apart. See DEFAULT_OAUTH_CALLBACK_HOST there.
+ */
 
 /**
  * Handle incoming HTTP requests to the callback server.
@@ -333,7 +339,7 @@ async function ensureCallbackServerLocked(options: EnsureCallbackServerOptions =
 
   const previousServer = server
   const needsStrictRebind = Boolean(previousServer && strictPort && getOAuthCallbackPort() !== requiredPort)
-  const needsHostSwitch = Boolean(previousServer && callbackServerHost !== requestedHost)
+  const needsHostSwitch = Boolean(previousServer && getOAuthCallbackHost() !== requestedHost)
   const needsPathSwitch = Boolean(previousServer && getOAuthCallbackPath() !== requestedPath)
 
   if (previousServer) {
@@ -355,7 +361,7 @@ async function ensureCallbackServerLocked(options: EnsureCallbackServerOptions =
 
     if (pendingAuths.size > 0 || reservedAuthStates.size > 0) {
       throw new Error(
-        `OAuth callback server is running on ${callbackServerHost}:${getOAuthCallbackPort()}, but strict callback endpoint ${requestedHost}:${requiredPort} is required and cannot be switched while authorizations are pending`
+        `OAuth callback server is running on ${getOAuthCallbackHost()}:${getOAuthCallbackPort()}, but strict callback endpoint ${requestedHost}:${requiredPort} is required and cannot be switched while authorizations are pending`
       )
     }
   }
@@ -390,7 +396,7 @@ async function ensureCallbackServerLocked(options: EnsureCallbackServerOptions =
       })
     }
 
-    callbackServerHost = requestedHost
+    setOAuthCallbackHost(requestedHost)
     setOAuthCallbackPath(requestedPath)
     server = candidateServer
     if (options.reserveState && options.oauthState) {
@@ -484,7 +490,7 @@ export function stopCallbackServer(): Promise<void> {
     }
 
     setOAuthCallbackPort(getConfiguredOAuthCallbackPort())
-    callbackServerHost = DEFAULT_OAUTH_CALLBACK_HOST
+    setOAuthCallbackHost(DEFAULT_OAUTH_CALLBACK_HOST)
     setOAuthCallbackPath(DEFAULT_OAUTH_CALLBACK_PATH)
 
     // Reject all pending auths (defer to allow any pending operations to complete)
