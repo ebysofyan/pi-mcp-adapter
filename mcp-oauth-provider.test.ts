@@ -16,6 +16,7 @@ process.env.MCP_OAUTH_DIR = TEST_DIR
 import {
   getOAuthCallbackPath,
   getOAuthCallbackPort,
+  getOAuthCallbackHost,
   McpOAuthProvider,
   setOAuthCallbackPath,
   setOAuthCallbackPort,
@@ -67,8 +68,16 @@ describe("McpOAuthProvider", () => {
       const provider = createProvider()
       assert.strictEqual(
         provider.redirectUrl,
-        "http://localhost:19876/callback"
+        "http://127.0.0.1:19876/callback"
       )
+    })
+
+    it("should default to the RFC 8252 loopback IP literal, not the localhost hostname", () => {
+      const provider = createProvider()
+      const redirect = new URL(provider.redirectUrl!)
+      assert.strictEqual(redirect.hostname, "127.0.0.1")
+      assert.notStrictEqual(redirect.hostname, "localhost")
+      assert.strictEqual(redirect.pathname, "/callback")
     })
 
     it("should use a configured redirect URI", () => {
@@ -87,8 +96,8 @@ describe("McpOAuthProvider", () => {
         setOAuthCallbackPort(52345)
         setOAuthCallbackPath("/changed/callback")
 
-        assert.strictEqual(provider.redirectUrl, "http://localhost:41234/snapshot/callback")
-        assert.deepStrictEqual(provider.clientMetadata.redirect_uris, ["http://localhost:41234/snapshot/callback"])
+        assert.strictEqual(provider.redirectUrl, "http://127.0.0.1:41234/snapshot/callback")
+        assert.deepStrictEqual(provider.clientMetadata.redirect_uris, ["http://127.0.0.1:41234/snapshot/callback"])
       } finally {
         setOAuthCallbackPort(originalPort)
         setOAuthCallbackPath(originalPath)
@@ -113,7 +122,7 @@ describe("McpOAuthProvider", () => {
       const provider = createProvider()
       const metadata = provider.clientMetadata
 
-      assert.deepStrictEqual(metadata.redirect_uris, ["http://localhost:19876/callback"])
+      assert.deepStrictEqual(metadata.redirect_uris, ["http://127.0.0.1:19876/callback"])
       assert.strictEqual(metadata.client_name, "Pi Coding Agent")
       assert.strictEqual(metadata.client_uri, "https://github.com/nicobailon/pi-mcp-adapter")
       assert.deepStrictEqual(metadata.grant_types, ["authorization_code", "refresh_token"])
@@ -315,7 +324,7 @@ describe("McpOAuthProvider", () => {
         clientInfo: {
           clientId: "public-client",
           clientIdIssuedAt: Math.floor(Date.now() / 1000),
-          redirectUris: ["http://localhost:19876/callback"],
+          redirectUris: ["http://127.0.0.1:19876/callback"],
         },
         serverUrl,
       }, serverUrl)
@@ -383,7 +392,7 @@ describe("McpOAuthProvider", () => {
         clientInfo: {
           clientId: "stored-client",
           clientSecret: "stored-secret",
-          redirectUris: ["http://localhost:19876/callback"],
+          redirectUris: ["http://127.0.0.1:19876/callback"],
         },
         serverUrl,
       }, serverUrl)

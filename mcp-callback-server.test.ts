@@ -17,7 +17,45 @@ import {
   getPendingAuthCount,
   releaseCallbackServer,
 } from "./mcp-callback-server.ts"
-import { getConfiguredOAuthCallbackPort, getOAuthCallbackPath, getOAuthCallbackPort } from "./mcp-oauth-provider.ts"
+import { getConfiguredOAuthCallbackPort, getOAuthCallbackPath, getOAuthCallbackPort, McpOAuthProvider } from "./mcp-oauth-provider.ts"
+
+/**
+ * Occupy `port` on whichever loopback addresses this host actually has, so the
+ * port is genuinely unavailable to the callback listener. A family that cannot
+ * bind is skipped rather than failing the fixture, so these tests behave the
+ * same on single-family and dual-stack hosts. The returned function always
+ * closes every blocker that did open, including after a partial failure.
+ */
+async function squatPort(port: number): Promise<() => Promise<void>> {
+  const opened: import("node:http").Server[] = []
+  const release = async () => {
+    for (const server of opened.splice(0)) {
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  }
+  try {
+    for (const host of ["127.0.0.1", "::1"]) {
+      const server = createServer((_req, res) => {
+        res.writeHead(200)
+        res.end("blocked")
+      })
+      try {
+        await new Promise<void>((resolve, reject) => {
+          server.once("error", reject)
+          server.listen(port, host, () => resolve())
+        })
+        opened.push(server)
+      } catch {
+        // This family is unavailable here; the other one still blocks the port.
+        await new Promise<void>((resolve) => server.close(() => resolve()))
+      }
+    }
+  } catch (error) {
+    await release()
+    throw error
+  }
+  return release
+}
 
 async function getFreePort(): Promise<number> {
   const probe = createServer()
@@ -61,7 +99,7 @@ describe("mcp-callback-server", () => {
       await ensureCallbackServer({ oauthState: "reserved-initial-state", reserveState: true })
 
       await assert.rejects(
-        async () => await ensureCallbackServer({ callbackHost: "127.0.0.1" }),
+        async () => await ensureCallbackServer({ callbackHost: "203.0.113.5" }),
         /cannot be switched while authorizations are pending/
       )
 
@@ -72,11 +110,25 @@ describe("mcp-callback-server", () => {
       await ensureCallbackServer({ oauthState: "reserved-host-state", reserveState: true })
 
       await assert.rejects(
-        async () => await ensureCallbackServer({ callbackHost: "127.0.0.1" }),
+        async () => await ensureCallbackServer({ callbackHost: "203.0.113.5" }),
         /cannot be switched while authorizations are pending/
       )
 
       releaseCallbackServer("reserved-host-state")
+    })
+
+    it("should not treat another loopback spelling as a host switch", async () => {
+      // All loopback spellings name the same interface and the listener binds
+      // the whole set, so none of these may demand a rebind while an
+      // authorization is reserved.
+      await ensureCallbackServer({ oauthState: "loopback-alias-state", reserveState: true })
+
+      for (const host of ["127.0.0.1", "::1", "localhost"]) {
+        await ensureCallbackServer({ callbackHost: host, oauthState: `alias-${host}`, reserveState: true })
+        releaseCallbackServer(`alias-${host}`)
+      }
+
+      releaseCallbackServer("loopback-alias-state")
     })
 
     it("should not switch callback paths while callback state is reserved", async () => {
@@ -93,15 +145,7 @@ describe("mcp-callback-server", () => {
 
     it("should release reserved callback state when strict binding fails", async () => {
       const port = await getFreePort()
-      const blocker = createServer((_req, res) => {
-        res.writeHead(200)
-        res.end("blocked")
-      })
-
-      await new Promise<void>((resolve, reject) => {
-        blocker.once("error", reject)
-        blocker.listen(port, "localhost", resolve)
-      })
+      const releasePort = await squatPort(port)
 
       try {
         await assert.rejects(
@@ -109,12 +153,86 @@ describe("mcp-callback-server", () => {
           /already in use/
         )
       } finally {
-        await new Promise<void>((resolve) => blocker.close(() => resolve()))
+        await releasePort()
       }
 
       await ensureCallbackServer({ callbackPath: "/after-failure" })
       await ensureCallbackServer({ callbackPath: "/after-failure-switch" })
       assert.strictEqual(getOAuthCallbackPath(), "/after-failure-switch")
+    })
+
+    it("should fail startup when an explicitly configured redirect address cannot be bound", async () => {
+      // A configured redirect_uri naming [::1] sends the browser to that
+      // literal. If the address is already taken, continuing would leave this
+      // adapter advertising a callback that another local process receives.
+      const port = await getFreePort()
+      const squatter = createServer((_req, res) => {
+        res.writeHead(200)
+        res.end("not the oauth callback")
+      })
+
+      await new Promise<void>((resolve, reject) => {
+        squatter.once("error", reject)
+        squatter.listen(port, "::1", resolve)
+      })
+
+      try {
+        await assert.rejects(
+          async () => await ensureCallbackServer({
+            strictPort: true,
+            port,
+            callbackHost: "::1",
+            oauthState: "occupied-redirect-state",
+            reserveState: true,
+          }),
+          /EADDRINUSE|already in use/
+        )
+        // Nothing may be left listening, and no state may be reserved.
+        assert.strictEqual(getPendingAuthCount(), 0)
+        assert.strictEqual(isCallbackServerRunning(), false)
+      } finally {
+        await new Promise<void>((resolve) => squatter.close(() => resolve()))
+      }
+    })
+
+    it("should fail startup when an explicit localhost redirect cannot bind every loopback address", async () => {
+      // `localhost` may resolve to either family, so binding one address and
+      // still advertising `localhost` lets the browser pick the address this
+      // process does not hold - and whoever does hold it gets the code.
+      const port = await getFreePort()
+      const squatter = createServer((_req, res) => {
+        res.writeHead(200)
+        res.end("not the oauth callback")
+      })
+      await new Promise<void>((resolve, reject) => {
+        squatter.once("error", reject)
+        squatter.listen(port, "::1", resolve)
+      })
+
+      try {
+        await assert.rejects(
+          async () => await ensureCallbackServer({
+            strictPort: true,
+            port,
+            callbackHost: "localhost",
+            oauthState: "localhost-alias-state",
+            reserveState: true,
+          }),
+          /EADDRINUSE|already in use/
+        )
+        assert.strictEqual(isCallbackServerRunning(), false)
+      } finally {
+        await new Promise<void>((resolve) => squatter.close(() => resolve()))
+      }
+    })
+
+    it("should still tolerate an absent loopback family for the default redirect", async () => {
+      // The default redirect is composed from whichever address bound, so an
+      // unavailable family must not block startup. This is the counterpart to
+      // the two refusal tests above and must not regress into strictness.
+      await ensureCallbackServer({ oauthState: "default-tolerates-state", reserveState: true })
+      assert.strictEqual(isCallbackServerRunning(), true)
+      releaseCallbackServer("default-tolerates-state")
     })
 
     it("should bind an explicit strict host, port, and custom callback path", async () => {
@@ -132,17 +250,75 @@ describe("mcp-callback-server", () => {
       assert.strictEqual((await callbackPromise).code, "ok")
     })
 
+    it("serves the redirect URI the OAuth provider actually advertises", async () => {
+      // Regression guard for the bind/advertise coupling: a listener bound to a
+      // different address than the advertised redirect_uri reaches ECONNREFUSED
+      // *after* consent, which is far harder to diagnose than a 400 before it.
+      // Comparing the advertised host against the getter that produced it would
+      // pass even under that drift, so drive the real socket instead.
+      await ensureCallbackServer({ oauthState: "advertised-state", reserveState: true })
+
+      const provider = new McpOAuthProvider(
+        "advertised",
+        "https://mcp.example.com",
+        { clientId: "test-client" },
+        { onRedirect: async () => {} },
+      )
+      const advertised = new URL(provider.redirectUrl!)
+
+      const callbackPromise = waitForCallback("advertised-state")
+      advertised.searchParams.set("code", "delivered-code")
+      advertised.searchParams.set("state", "advertised-state")
+
+      const response = await fetch(advertised)
+      assert.strictEqual(response.status, 200)
+      assert.strictEqual((await callbackPromise).code, "delivered-code")
+
+      releaseCallbackServer("advertised-state")
+    })
+
+    it("accepts every loopback spelling of the redirect host", async () => {
+      // RFC 8252 section 7.3 recommends binding both loopback families. A host
+      // with only one of them must still authorize, and a redirect_uri naming
+      // `localhost` must reach whichever family that resolves to.
+      await ensureCallbackServer({ oauthState: "family-state", reserveState: true })
+      const port = getOAuthCallbackPort()
+
+      for (const host of ["127.0.0.1", "[::1]", "localhost"]) {
+        const probe = new URL(`http://${host}:${port}/callback`)
+        probe.searchParams.set("code", "x")
+        // An unknown state proves the request reached the handler: it is
+        // rejected with 400 rather than throwing ECONNREFUSED.
+        probe.searchParams.set("state", "no-such-flow")
+        const response = await fetch(probe)
+        assert.strictEqual(response.status, 400, `${host} should reach the callback listener`)
+      }
+
+      releaseCallbackServer("family-state")
+    })
+
+    it("allows a pending default authorization alongside an explicit localhost redirect", async () => {
+      // The default host and an explicitly configured `localhost` redirect are
+      // the same interface, so neither may need a host switch while the other
+      // holds a reservation.
+      await ensureCallbackServer({ oauthState: "concurrent-default", reserveState: true })
+      await ensureCallbackServer({ callbackHost: "localhost", oauthState: "concurrent-localhost", reserveState: true })
+
+      const port = getOAuthCallbackPort()
+      const waiter = waitForCallback("concurrent-localhost")
+      const redirect = new URL(`http://localhost:${port}/callback`)
+      redirect.searchParams.set("code", "localhost-code")
+      redirect.searchParams.set("state", "concurrent-localhost")
+
+      assert.strictEqual((await fetch(redirect)).status, 200)
+      assert.strictEqual((await waiter).code, "localhost-code")
+
+      releaseCallbackServer("concurrent-default")
+    })
+
     it("should reject an occupied explicit strict port", async () => {
       const port = await getFreePort()
-      const blocker = createServer((_req, res) => {
-        res.writeHead(200)
-        res.end("blocked")
-      })
-
-      await new Promise<void>((resolve, reject) => {
-        blocker.once("error", reject)
-        blocker.listen(port, "localhost", resolve)
-      })
+      const releasePort = await squatPort(port)
 
       try {
         await assert.rejects(
@@ -150,22 +326,15 @@ describe("mcp-callback-server", () => {
           /already in use/
         )
       } finally {
-        await new Promise<void>((resolve) => blocker.close(() => resolve()))
+        await releasePort()
       }
     })
 
     it("should use an OS-assigned port when the configured non-strict port is occupied", async () => {
       const configuredPort = getConfiguredOAuthCallbackPort()
-      const blocker = createServer((_req, res) => {
-        res.writeHead(200)
-        res.end("blocked")
-      })
-
+      let releasePort: (() => Promise<void>) | undefined
       try {
-        await new Promise<void>((resolve, reject) => {
-          blocker.once("error", reject)
-          blocker.listen(configuredPort, "localhost", resolve)
-        })
+        releasePort = await squatPort(configuredPort)
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "EADDRINUSE") return
         throw error
@@ -187,7 +356,7 @@ describe("mcp-callback-server", () => {
           /already in use/
         )
       } finally {
-        await new Promise<void>((resolve) => blocker.close(() => resolve()))
+        await releasePort?.()
       }
     })
   })

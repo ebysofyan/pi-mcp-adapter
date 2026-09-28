@@ -8,10 +8,13 @@
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "http"
 import { getAppName } from "./agent-dir.ts"
 import {
+  DEFAULT_OAUTH_CALLBACK_HOST,
   DEFAULT_OAUTH_CALLBACK_PATH,
   getConfiguredOAuthCallbackPort,
+  getOAuthCallbackHost,
   getOAuthCallbackPath,
   getOAuthCallbackPort,
+  setOAuthCallbackHost,
   setOAuthCallbackPath,
   setOAuthCallbackPort,
 } from "./mcp-oauth-provider.ts"
@@ -177,13 +180,46 @@ interface PendingAuth {
 }
 
 /** Server singleton state */
-let server: Server | undefined
+let servers = new Map<string, Server>()
 let bindingPromise: Promise<void> | undefined
 let stoppingPromise: Promise<void> | undefined
 let restartableStoppingPromise: Promise<void> | undefined
 let callbackGeneration = 0
 const pendingAuths = new Map<string, PendingAuth>()
 const reservedAuthStates = new Set<string>()
+
+/**
+ * Loopback addresses the callback listener binds.
+ *
+ * RFC 8252 section 7.3 recommends that clients bind both IPv4 and IPv6
+ * loopback and use whichever is available, because a host is not guaranteed
+ * to have both. Binding the whole set also means a redirect_uri naming any
+ * loopback spelling (127.0.0.1, ::1, or localhost, which resolves to one of
+ * them) reaches this listener. That is what lets a pending authorization on
+ * the default host coexist with a separately configured loopback redirect
+ * instead of forcing a host switch.
+ */
+const LOOPBACK_CALLBACK_HOSTS = ["127.0.0.1", "::1"] as const
+
+/** Hostnames that name the loopback interface rather than an address to bind. */
+const LOOPBACK_ALIASES = new Set(["localhost", "127.0.0.1", "::1", "[::1]"])
+
+function isLoopbackAlias(host: string): boolean {
+  return LOOPBACK_ALIASES.has(host.toLowerCase())
+}
+
+/** Whether `host` is a loopback address literal rather than a name that resolves to one. */
+function isLoopbackIpLiteral(host: string): boolean {
+  return (LOOPBACK_CALLBACK_HOSTS as readonly string[]).includes(host)
+}
+
+/** Whether the already-bound listeners can serve a redirect for `requestedHost`. */
+function boundHostsCoverRequest(bound: Map<string, Server>, requestedHost: string): boolean {
+  if (bound.size === 0) return true
+  if (bound.has(requestedHost)) return true
+  if (!isLoopbackAlias(requestedHost)) return false
+  return LOOPBACK_CALLBACK_HOSTS.every((host) => bound.has(host))
+}
 
 /** Timeout for callback completion (5 minutes) */
 const CALLBACK_TIMEOUT_MS = 5 * 60 * 1000
@@ -197,8 +233,11 @@ interface EnsureCallbackServerOptions {
   reserveState?: boolean
 }
 
-const DEFAULT_OAUTH_CALLBACK_HOST = "localhost"
-let callbackServerHost = DEFAULT_OAUTH_CALLBACK_HOST
+/**
+ * The loopback host is owned by `mcp-oauth-provider.ts` so the bind address
+ * and the redirect URI advertised to the authorization server can never
+ * drift apart. See DEFAULT_OAUTH_CALLBACK_HOST there.
+ */
 
 /**
  * Handle incoming HTTP requests to the callback server.
@@ -331,12 +370,12 @@ async function ensureCallbackServerLocked(options: EnsureCallbackServerOptions =
   }
   let reservedState: string | undefined
 
-  const previousServer = server
-  const needsStrictRebind = Boolean(previousServer && strictPort && getOAuthCallbackPort() !== requiredPort)
-  const needsHostSwitch = Boolean(previousServer && callbackServerHost !== requestedHost)
-  const needsPathSwitch = Boolean(previousServer && getOAuthCallbackPath() !== requestedPath)
+  const previousServers = servers
+  const needsStrictRebind = Boolean(previousServers.size > 0 && strictPort && getOAuthCallbackPort() !== requiredPort)
+  const needsHostSwitch = !boundHostsCoverRequest(previousServers, requestedHost)
+  const needsPathSwitch = Boolean(previousServers.size > 0 && getOAuthCallbackPath() !== requestedPath)
 
-  if (previousServer) {
+  if (previousServers.size > 0) {
     if (!needsStrictRebind && !needsHostSwitch) {
       if (needsPathSwitch) {
         if (pendingAuths.size > 0 || reservedAuthStates.size > 0) {
@@ -355,58 +394,100 @@ async function ensureCallbackServerLocked(options: EnsureCallbackServerOptions =
 
     if (pendingAuths.size > 0 || reservedAuthStates.size > 0) {
       throw new Error(
-        `OAuth callback server is running on ${callbackServerHost}:${getOAuthCallbackPort()}, but strict callback endpoint ${requestedHost}:${requiredPort} is required and cannot be switched while authorizations are pending`
+        `OAuth callback server is running on ${getOAuthCallbackHost()}:${getOAuthCallbackPort()}, but strict callback endpoint ${requestedHost}:${requiredPort} is required and cannot be switched while authorizations are pending`
       )
     }
   }
 
-  const candidateServer = createServer(handleRequest)
-  const listenPort = strictPort ? requiredPort : 0
+  // Every loopback alias resolves to one of these, so binding the set keeps a
+  // pending authorization from blocking a differently spelled loopback redirect.
+  const targetHosts = isLoopbackAlias(requestedHost) ? [...LOOPBACK_CALLBACK_HOSTS] : [requestedHost]
+  // What the advertised redirect actually depends on:
+  //
+  // - A configured address literal appears verbatim in the redirect_uri, so
+  //   that exact address must bind. Failing it would hand the authorization
+  //   code to whoever holds it.
+  // - A configured `localhost` is a name that may resolve to either family, so
+  //   every loopback address must bind. Binding one and still advertising
+  //   `localhost` leaves the browser free to pick the address we did not hold.
+  // - The default is not load-bearing: the advertised redirect is composed from
+  //   whichever address ends up bound, so an absent family cannot strand it and
+  //   one bound address suffices.
+  const configuredHost = options.callbackHost
+  const requiredHost = configuredHost !== undefined && isLoopbackIpLiteral(requestedHost)
+    ? requestedHost
+    : undefined
+  const requireAllLoopback = configuredHost !== undefined
+    && isLoopbackAlias(requestedHost)
+    && !isLoopbackIpLiteral(requestedHost)
+  const opened = new Map<string, Server>()
+  let lastError: unknown
 
   try {
-    await new Promise<void>((resolve, reject) => {
-      candidateServer.once("error", (err) => {
-        reject(err)
-      })
-
-      candidateServer.listen(listenPort, requestedHost, () => {
-        resolve()
-      })
-    })
-
-    if (strictPort) {
-      setOAuthCallbackPort(requiredPort)
-    } else {
-      const address = candidateServer.address()
-      if (!address || typeof address === "string" || typeof address.port !== "number") {
-        throw new Error("OAuth callback server did not report an assigned port")
+    for (const host of targetHosts) {
+      const candidateServer = createServer(handleRequest)
+      // The first bind decides the port so every listener shares one.
+      const listenPort = opened.size === 0 ? (strictPort ? requiredPort : 0) : getOAuthCallbackPort()
+      try {
+        await new Promise<void>((resolve, reject) => {
+          candidateServer.once("error", reject)
+          candidateServer.listen(listenPort, host, resolve)
+        })
+        const address = candidateServer.address()
+        if (!address || typeof address === "string" || typeof address.port !== "number") {
+          throw new Error("OAuth callback server did not report an assigned port")
+        }
+        // In strict mode the port was requested explicitly, so keep it verbatim
+        // rather than re-reading it; otherwise adopt the assigned port.
+        setOAuthCallbackPort(strictPort ? requiredPort : address.port)
+        opened.set(host, candidateServer)
+      } catch (error) {
+        await new Promise<void>((resolve) => candidateServer.close(() => resolve()))
+        // A redirect_uri naming this exact address depends on it. If it cannot
+        // bind, whoever holds it would receive the authorization code, so fail
+        // startup rather than advertise a callback this process never serves.
+        if (host === requiredHost) throw error
+        // An explicit `localhost` redirect can resolve to this address, so it
+        // is required too: advertising a name the browser may resolve to an
+        // address we failed to hold would deliver the code elsewhere.
+        if (requireAllLoopback) throw error
+        // Otherwise this is an optional loopback family: an absent one must not
+        // block a host that is only IPv4 or only IPv6.
+        lastError = error
+        continue
       }
-      setOAuthCallbackPort(address.port)
     }
 
-    if (previousServer && (needsStrictRebind || needsHostSwitch)) {
-      await new Promise<void>((resolve) => {
-        previousServer.close(() => resolve())
-      })
+    // Re-throw the underlying failure (not a synthesized one) so the
+    // EADDRINUSE guidance below still reaches the caller.
+    if (opened.size === 0) throw lastError
+
+    if (previousServers.size > 0 && (needsStrictRebind || needsHostSwitch)) {
+      await Promise.all([...previousServers.values()].map(
+        (previous) => new Promise<void>((resolve) => previous.close(() => resolve())),
+      ))
     }
 
-    callbackServerHost = requestedHost
+    const activeHost = opened.has(DEFAULT_OAUTH_CALLBACK_HOST)
+      ? DEFAULT_OAUTH_CALLBACK_HOST
+      : opened.keys().next().value ?? DEFAULT_OAUTH_CALLBACK_HOST
+    setOAuthCallbackHost(activeHost)
     setOAuthCallbackPath(requestedPath)
-    server = candidateServer
+    servers = opened
     if (options.reserveState && options.oauthState) {
       reservedAuthStates.add(options.oauthState)
       reservedState = options.oauthState
     }
-    server.unref()
+    for (const listener of opened.values()) listener.unref()
   } catch (error) {
     if (reservedState) {
       reservedAuthStates.delete(reservedState)
     }
-    const nodeError = error as NodeJS.ErrnoException
-    await new Promise<void>((resolve) => {
-      candidateServer.close(() => resolve())
-    })
+    await Promise.all([...opened.values()].map(
+      (listener) => new Promise<void>((resolve) => listener.close(() => resolve())),
+    ))
 
+    const nodeError = error as NodeJS.ErrnoException
     if (strictPort && nodeError.code === "EADDRINUSE") {
       throw new Error(
         `OAuth callback port ${requiredPort} is already in use. Pre-registered OAuth clients require an exact redirect URI; set MCP_OAUTH_CALLBACK_PORT to your registered port or free port ${requiredPort}`,
@@ -474,17 +555,15 @@ export function stopCallbackServer(): Promise<void> {
       await bindingPromise.catch(() => {})
     }
 
-    if (server) {
-      await new Promise<void>((resolve) => {
-        server!.close(() => {
-          resolve()
-        })
-      })
-      server = undefined
+    if (servers.size > 0) {
+      await Promise.all([...servers.values()].map(
+        (listener) => new Promise<void>((resolve) => listener.close(() => resolve())),
+      ))
+      servers = new Map()
     }
 
     setOAuthCallbackPort(getConfiguredOAuthCallbackPort())
-    callbackServerHost = DEFAULT_OAUTH_CALLBACK_HOST
+    setOAuthCallbackHost(DEFAULT_OAUTH_CALLBACK_HOST)
     setOAuthCallbackPath(DEFAULT_OAUTH_CALLBACK_PATH)
 
     // Reject all pending auths (defer to allow any pending operations to complete)
@@ -509,7 +588,7 @@ export function stopCallbackServer(): Promise<void> {
 /** Stop the callback server only when no bind or authorization owns it. */
 export function stopCallbackServerIfIdle(): Promise<void> {
   if (stoppingPromise) return stoppingPromise
-  if (bindingPromise || !server || pendingAuths.size > 0 || reservedAuthStates.size > 0) {
+  if (bindingPromise || servers.size === 0 || pendingAuths.size > 0 || reservedAuthStates.size > 0) {
     return Promise.resolve()
   }
   const operation = stopCallbackServer().finally(() => {
@@ -523,7 +602,7 @@ export function stopCallbackServerIfIdle(): Promise<void> {
  * Check if the callback server is running.
  */
 export function isCallbackServerRunning(): boolean {
-  return server !== undefined
+  return servers.size > 0
 }
 
 /**
