@@ -17,7 +17,7 @@ import {
   getPendingAuthCount,
   releaseCallbackServer,
 } from "./mcp-callback-server.ts"
-import { getConfiguredOAuthCallbackPort, getOAuthCallbackPath, getOAuthCallbackPort, McpOAuthProvider } from "./mcp-oauth-provider.ts"
+import { getConfiguredOAuthCallbackPort, getOAuthCallbackPath, getOAuthCallbackPort, setOAuthCallbackHost, McpOAuthProvider } from "./mcp-oauth-provider.ts"
 
 /**
  * Which loopback families this host can actually bind, probed once per run.
@@ -435,6 +435,43 @@ describe("mcp-callback-server", () => {
         /cannot be switched while authorizations are pending/,
       )
       releaseCallbackServer("absent-literal-state")
+    })
+
+    it("serves an advertised IPv6 redirect URI while binding the bare address", async () => {
+      // The bind address is bare (`::1`) but the advertised redirect must carry
+      // the RFC 2732 brackets. Set the active host directly: the bind loop always
+      // prefers 127.0.0.1 when it can, so an IPv6-only host cannot be simulated
+      // by asking for one. Driving the real socket proves the advertised URI is
+      // both parseable and actually served.
+      await ensureCallbackServer({ oauthState: "ipv6-advertised-state", reserveState: true })
+      const port = getOAuthCallbackPort()
+      setOAuthCallbackHost("::1")
+
+      try {
+        const provider = new McpOAuthProvider(
+          "ipv6-advertised",
+          "https://mcp.example.com",
+          { clientId: "test-client" },
+          { onRedirect: async () => {} },
+        )
+        assert.strictEqual(provider.redirectUrl, `http://[::1]:${port}/callback`)
+
+        const advertised = new URL(provider.redirectUrl!)
+        // WHATWG URL retains the brackets in `hostname` for IPv6.
+        assert.strictEqual(advertised.hostname, "[::1]")
+
+        const callbackPromise = waitForCallback("ipv6-advertised-state")
+        advertised.searchParams.set("code", "ipv6-code")
+        advertised.searchParams.set("state", "ipv6-advertised-state")
+
+        assert.strictEqual((await fetch(advertised)).status, 200)
+        assert.strictEqual((await callbackPromise).code, "ipv6-code")
+      } finally {
+        // The handler is reached by Host header or path, not by bind address, so
+        // this proves the brackets survive to a real request.
+        setOAuthCallbackHost("127.0.0.1")
+        releaseCallbackServer("ipv6-advertised-state")
+      }
     })
 
     it("allows a pending default authorization alongside an explicit localhost redirect", async () => {

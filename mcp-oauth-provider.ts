@@ -107,6 +107,23 @@ const DEFAULT_OAUTH_CALLBACK_PATH = "/callback"
  */
 const DEFAULT_OAUTH_CALLBACK_HOST = "127.0.0.1"
 
+/**
+ * Render `host` for use in a URI authority.
+ *
+ * The active callback host is a bare bind address, so on an IPv6-only host it is
+ * `::1`. RFC 2732 requires an IPv6 literal in a URI to be bracketed, and
+ * `http://::1:19876/callback` is not a valid URL at all: `new URL()` rejects it,
+ * and a server that parses the redirect_uri by hand reads the host as `::1:`.
+ * That breaks the authorize leg on exactly the hosts that need the IPv6 literal.
+ *
+ * Only the advertised string is bracketed. The bind address, the host
+ * comparisons in the callback server, and `isLoopbackIpLiteral` all keep working
+ * with the bare form, so a bracketed host never reaches `listen()`.
+ */
+export function formatOAuthCallbackUriHost(host: string): string {
+  return host === "::1" ? "[::1]" : host
+}
+
 let configuredOAuthCallbackPort = DEFAULT_OAUTH_CALLBACK_PORT
 
 if (process.env.MCP_OAUTH_CALLBACK_PORT) {
@@ -311,7 +328,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
     this.flowState = initialState
     this.redirectUrlSnapshot = config.grantType === "client_credentials"
       ? undefined
-      : config.redirectUri ?? `http://${getOAuthCallbackHost()}:${getOAuthCallbackPort()}${getOAuthCallbackPath()}`
+      : config.redirectUri ?? `http://${formatOAuthCallbackUriHost(getOAuthCallbackHost())}:${getOAuthCallbackPort()}${getOAuthCallbackPath()}`
   }
 
   setAuthFetch(fetchFn: OAuthFetch): void {

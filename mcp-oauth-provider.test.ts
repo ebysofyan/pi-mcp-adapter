@@ -14,10 +14,12 @@ const TEST_DIR = join(tmpdir(), `mcp-oauth-test-${randomBytes(4).toString('hex')
 process.env.MCP_OAUTH_DIR = TEST_DIR
 
 import {
+  formatOAuthCallbackUriHost,
   getOAuthCallbackPath,
   getOAuthCallbackPort,
   getOAuthCallbackHost,
   McpOAuthProvider,
+  setOAuthCallbackHost,
   setOAuthCallbackPath,
   setOAuthCallbackPort,
   type McpOAuthConfig,
@@ -78,6 +80,51 @@ describe("McpOAuthProvider", () => {
       assert.strictEqual(redirect.hostname, "127.0.0.1")
       assert.notStrictEqual(redirect.hostname, "localhost")
       assert.strictEqual(redirect.pathname, "/callback")
+    })
+
+    it("should bracket an IPv6 loopback host per RFC 2732", () => {
+      // On an IPv6-only host the active callback host is the bare bind address
+      // `::1`. Composed unbracketed it yields `http://::1:19876/callback`, which
+      // is not a parseable URL at all, so the authorize leg would break on
+      // exactly the hosts that are forced onto the IPv6 literal.
+      const originalHost = getOAuthCallbackHost()
+      const originalPort = getOAuthCallbackPort()
+      const originalPath = getOAuthCallbackPath()
+      setOAuthCallbackHost("::1")
+      setOAuthCallbackPort(19876)
+      setOAuthCallbackPath("/callback")
+
+      try {
+        const provider = createProvider()
+        assert.strictEqual(provider.redirectUrl, "http://[::1]:19876/callback")
+
+        // Must survive a real parser, not just a string comparison: the bracket
+        // is load-bearing and an unbracketed authority throws here. WHATWG URL
+        // keeps the brackets in `hostname` for IPv6, which is why
+        // parseOAuthRedirectUri accepts both "[::1]" and "::1".
+        const redirect = new URL(provider.redirectUrl!)
+        assert.strictEqual(redirect.hostname, "[::1]")
+        assert.strictEqual(redirect.port, "19876")
+        assert.strictEqual(redirect.pathname, "/callback")
+
+        // The DCR metadata advertises the same URI.
+        assert.deepStrictEqual(
+          provider.clientMetadata.redirect_uris,
+          ["http://[::1]:19876/callback"],
+        )
+      } finally {
+        setOAuthCallbackHost(originalHost)
+        setOAuthCallbackPort(originalPort)
+        setOAuthCallbackPath(originalPath)
+      }
+    })
+
+    it("should leave IPv4 and hostname hosts unbracketed", () => {
+      assert.strictEqual(formatOAuthCallbackUriHost("127.0.0.1"), "127.0.0.1")
+      assert.strictEqual(formatOAuthCallbackUriHost("::1"), "[::1]")
+      // Idempotent for an already-bracketed literal, and pass-through otherwise.
+      assert.strictEqual(formatOAuthCallbackUriHost("[::1]"), "[::1]")
+      assert.strictEqual(formatOAuthCallbackUriHost("localhost"), "localhost")
     })
 
     it("should use a configured redirect URI", () => {
