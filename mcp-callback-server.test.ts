@@ -443,6 +443,9 @@ describe("mcp-callback-server", () => {
       // prefers 127.0.0.1 when it can, so an IPv6-only host cannot be simulated
       // by asking for one. Driving the real socket proves the advertised URI is
       // both parseable and actually served.
+      const available = await availableLoopbackHosts()
+      if (!available.has("::1")) return
+
       await ensureCallbackServer({ oauthState: "ipv6-advertised-state", reserveState: true })
       const port = getOAuthCallbackPort()
       setOAuthCallbackHost("::1")
